@@ -61,7 +61,7 @@ process.on("unhandledRejection", (reason) => {
 
 const { Readable } = require("node:stream")
 //require("os").setPriority(0, require("os").constants.priority.PRIORITY_BELOW_NORMAL)
-const { BrowserWindow, nativeTheme, systemPreferences, Menu, ipcMain, screen, globalShortcut, powerMonitor } = require('electron')
+const { BrowserWindow, nativeTheme, systemPreferences, Menu, ipcMain, screen, globalShortcut, powerMonitor, powerSaveBlocker } = require('electron')
 const uuid = require('crypto').randomUUID
 
 // Expose GC
@@ -284,8 +284,79 @@ let monitorInventoryRecoveryTimer = false
 let isAppQuitting = false
 let ddcSafetyRetryPromise = false
 
+let systemSleepBlockerId = null
+let batteryDisplaySleepBlockerId = null
+let sleepBlockerRefreshInterval = null
+let softDisplaySleepActive = false
+
+function startSystemSleepPrevention() {
+  try {
+    const nextId = powerSaveBlocker.start("prevent-app-suspension")
+    if (systemSleepBlockerId !== null && powerSaveBlocker.isStarted(systemSleepBlockerId)) {
+      powerSaveBlocker.stop(systemSleepBlockerId)
+    }
+    systemSleepBlockerId = nextId
+  } catch (e) {
+    console.error("Couldn't start system sleep blocker:", e)
+  }
+
+  const updateBatteryDisplayBlocker = () => {
+    try {
+      if (powerMonitor.onBatteryPower) {
+        if (batteryDisplaySleepBlockerId === null || !powerSaveBlocker.isStarted(batteryDisplaySleepBlockerId)) {
+          batteryDisplaySleepBlockerId = powerSaveBlocker.start("prevent-display-sleep")
+        }
+      } else if (batteryDisplaySleepBlockerId !== null) {
+        if (powerSaveBlocker.isStarted(batteryDisplaySleepBlockerId)) {
+          powerSaveBlocker.stop(batteryDisplaySleepBlockerId)
+        }
+        batteryDisplaySleepBlockerId = null
+      }
+    } catch (e) {
+      console.error("Couldn't update battery display sleep blocker:", e)
+    }
+  }
+
+  updateBatteryDisplayBlocker()
+  powerMonitor.on("on-battery", updateBatteryDisplayBlocker)
+  powerMonitor.on("on-ac", updateBatteryDisplayBlocker)
+
+  if (sleepBlockerRefreshInterval) clearInterval(sleepBlockerRefreshInterval)
+  sleepBlockerRefreshInterval = setInterval(() => {
+    try {
+      const nextId = powerSaveBlocker.start("prevent-app-suspension")
+      if (systemSleepBlockerId !== null && powerSaveBlocker.isStarted(systemSleepBlockerId)) {
+        powerSaveBlocker.stop(systemSleepBlockerId)
+      }
+      systemSleepBlockerId = nextId
+    } catch (e) {
+      console.error("Couldn't refresh system sleep blocker:", e)
+    }
+  }, 120000)
+}
+
+function stopSystemSleepPrevention() {
+  if (sleepBlockerRefreshInterval) {
+    clearInterval(sleepBlockerRefreshInterval)
+    sleepBlockerRefreshInterval = null
+  }
+  try {
+    if (systemSleepBlockerId !== null && powerSaveBlocker.isStarted(systemSleepBlockerId)) {
+      powerSaveBlocker.stop(systemSleepBlockerId)
+    }
+  } catch {}
+  systemSleepBlockerId = null
+  try {
+    if (batteryDisplaySleepBlockerId !== null && powerSaveBlocker.isStarted(batteryDisplaySleepBlockerId)) {
+      powerSaveBlocker.stop(batteryDisplaySleepBlockerId)
+    }
+  } catch {}
+  batteryDisplaySleepBlockerId = null
+}
+
 app.on('before-quit', () => {
   isAppQuitting = true
+  stopSystemSleepPrevention()
   if (monitorInventoryRecoveryTimer) {
     clearTimeout(monitorInventoryRecoveryTimer)
     monitorInventoryRecoveryTimer = false
@@ -1759,10 +1830,11 @@ function shouldSkipDisplay(monitorOrHwid1, skipEventCheck = false) {
 // Save all known displays to disk for future use
 async function updateKnownDisplays(force = false, immediate = false) {
 
-  // Skip when idle
-  if (!force && isUserIdle) return false;
+  // Skip when idle or during soft display sleep
+  if (!force && (isUserIdle || softDisplaySleepActive)) return false;
 
   const doFunc = () => {
+    if (!force && (isUserIdle || softDisplaySleepActive)) return false;
     try {
       // Get from file
       let known = getKnownDisplays(true)
@@ -1905,14 +1977,18 @@ const hotkeyCycleIndexes = []
 let lgtvPowerIsOff = false
 
 function sendLGTVCommand(...args) {
-  const cliPath = settings.lgtvCliPath || DEFAULT_LGTV_CLI_PATH
-  execFile(cliPath, args, (error, stdout, stderr) => {
-    if (error) {
-      console.error(`LGTVcli command failed (${args.join(" ")}) using "${cliPath}":`, error)
-      return
-    }
-    if (stderr?.trim()) console.error(`LGTVcli reported an error (${args.join(" ")}):`, stderr.trim())
-    if (stdout?.trim()) console.log(`LGTVcli (${args.join(" ")}):`, stdout.trim())
+  return new Promise((resolve, reject) => {
+    const cliPath = settings.lgtvCliPath || DEFAULT_LGTV_CLI_PATH
+    execFile(cliPath, args, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`LGTVcli command failed (${args.join(" ")}) using "${cliPath}":`, error)
+        reject(error)
+        return
+      }
+      if (stderr?.trim()) console.error(`LGTVcli reported an error (${args.join(" ")}):`, stderr.trim())
+      if (stdout?.trim()) console.log(`LGTVcli (${args.join(" ")}):`, stdout.trim())
+      resolve(stdout)
+    })
   })
 }
 
@@ -1944,15 +2020,24 @@ async function doHotkey(hotkey, options = {}) {
           if (action.includeLGTV) {
             lgtvPowerIsOff = !lgtvPowerIsOff
             if (lgtvPowerIsOff) {
-              sleepDisplays(settings.sleepAction, 500)
-              sendLGTVCommand("-poweroff")
+              sleepDisplays(settings.sleepAction, 500, { skipLGTV: true })
+              await sendLGTVCommand("-poweroff")
             } else {
-              sendLGTVCommand("-poweron")
+              await wakeSoftDisplaySleep()
+              await sendLGTVCommand("-screenon")
+              await sendLGTVCommand("-backlight", "100")
             }
+          } else if (softDisplaySleepActive) {
+            await wakeSoftDisplaySleep()
           } else {
             sleepDisplays(settings.sleepAction, 500)
           }
-        } else if (action.type === "refresh") {
+        } else {
+          if (softDisplaySleepActive) {
+            await wakeSoftDisplaySleep({ skipBrightnessRestore: action.type === "set" && action.target === "brightness" })
+          }
+        }
+        if (action.type === "refresh") {
           showOverlay = false
           await refreshMonitors(true, true)
         } else if (action.type === "set" || action.type === "offset" || action.type === "cycle") {
@@ -2090,7 +2175,7 @@ async function doHotkey(hotkey, options = {}) {
           if (action.includeLGTV && action.type === "set" && action.target === "brightness") {
             const brightness = Number(action.value)
             if (Number.isFinite(brightness)) {
-              sendLGTVCommand("-backlight", String(minMax(brightness)))
+              await sendLGTVCommand("-backlight", String(minMax(brightness)))
             }
           }
         }
@@ -3673,22 +3758,235 @@ function setRecentlyInteracted(hasInteracted) {
 }
 
 let sleepTimeout
-function sleepDisplays(mode = "ps", delayMS = 333) {
+let softDisplaySleepArmed = false
+let softSleepArmTimeout = null
+let softSleepWakeInterval = null
+let softSleepWindows = []
+let softSleepClosingWindows = false
+let softSleepSavedBrightness = {}
+let softSleepTurnedOffLGTV = false
+let softSleepUsedDDC = false
+
+const SOFT_SLEEP_BLACKOUT_URL = "data:text/html;charset=utf-8," + encodeURIComponent(
+  "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{margin:0;padding:0;width:100%;height:100%;background:#000;cursor:none;overflow:hidden;user-select:none;}</style></head><body><script>setTimeout(()=>{const wake=()=>{window.close()};addEventListener('mousedown',wake);addEventListener('wheel',wake,{passive:true});addEventListener('touchstart',wake,{passive:true});},600);</script></body></html>"
+)
+
+function hasConnectedLGTV() {
+  return Object.values(monitors || {}).some((monitor) => /\bLG TV\b/i.test(monitor?.name || ""))
+}
+
+async function enterSoftDisplaySleep(mode = "ps", options = {}) {
+  if (softDisplaySleepActive) return
+
+  softDisplaySleepActive = true
+  softDisplaySleepArmed = false
+  softSleepSavedBrightness = {}
+  softSleepTurnedOffLGTV = false
+  softSleepUsedDDC = (mode === "ddcci" || mode === "ps_ddcci")
+
+  if (updateKnownDisplaysTimeout) {
+    clearTimeout(updateKnownDisplaysTimeout)
+    updateKnownDisplaysTimeout = null
+  }
+
+  // Save current brightness levels and dim adjustable displays to 0 without persisting to known-displays.json
+  for (const monitor of Object.values(monitors || {})) {
+    try {
+      if (shouldSkipDisplay(monitor)) continue
+      if (monitor.type === "wmi" || monitor.type === "studio-display" || monitor.type === "software" || (monitor.type === "ddcci" && monitor.brightnessType) || usesGammaSlider(monitor)) {
+        if (Number.isFinite(monitor.brightness)) {
+          softSleepSavedBrightness[monitor.id] = monitor.brightness
+        }
+        updateBrightness(monitor.id, 0, false, "brightness")
+      }
+    } catch (e) {
+      console.log("Couldn't dim display for soft sleep:", e)
+    }
+  }
+
+  if (softSleepUsedDDC) {
+    for (let monitorID in monitors) {
+      const monitor = monitors[monitorID]
+      await turnOffDisplayDDC(monitor.hwid.join("#"))
+    }
+  }
+
+  // Blank connected LG TV via LGTVcli (-screenoff) instead of relying on SC_MONITORPOWER,
+  // which would force Modern Standby laptops into S0 sleep.
+  if (!options.skipLGTV && hasConnectedLGTV()) {
+    softSleepTurnedOffLGTV = true
+    sendLGTVCommand("-screenoff").catch((e) => {
+      console.error("Couldn't blank LG TV for soft display sleep:", e)
+    })
+  }
+
+  if (mode === "ps" || mode === "ps_ddcci") {
+    const displays = screen.getAllDisplays()
+    softSleepWindows = []
+    displays.forEach((display, idx) => {
+      try {
+        const bounds = display.bounds
+        const win = new BrowserWindow({
+          x: bounds.x,
+          y: bounds.y,
+          width: bounds.width,
+          height: bounds.height,
+          frame: false,
+          fullscreen: false,
+          alwaysOnTop: true,
+          skipTaskbar: true,
+          movable: false,
+          resizable: false,
+          minimizable: false,
+          maximizable: false,
+          focusable: true,
+          backgroundColor: "#000000",
+          autoHideMenuBar: true,
+          webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false
+          }
+        })
+        win.setBounds(bounds)
+        win.setFullScreen(true)
+        win.setAlwaysOnTop(true, "screen-saver")
+        win.loadURL(SOFT_SLEEP_BLACKOUT_URL)
+
+        win.webContents.on("before-input-event", (_event, input) => {
+          if (softDisplaySleepArmed && input.type === "keyDown") {
+            wakeSoftDisplaySleep()
+          }
+        })
+
+        win.on("closed", () => {
+          if (!softSleepClosingWindows && softDisplaySleepActive) {
+            wakeSoftDisplaySleep()
+          }
+        })
+
+        if (idx === 0) {
+          win.once("ready-to-show", () => {
+            if (!win.isDestroyed() && softDisplaySleepActive) win.focus()
+          })
+          win.focus()
+        }
+
+        softSleepWindows.push(win)
+      } catch (e) {
+        console.error("Couldn't create blackout window for soft display sleep:", e)
+      }
+    })
+  }
+
+  if (softSleepArmTimeout) clearTimeout(softSleepArmTimeout)
+  softSleepArmTimeout = setTimeout(() => {
+    if (!softDisplaySleepActive) return
+    softDisplaySleepArmed = true
+    const initialCursor = screen.getCursorScreenPoint()
+    let prevIdleTime = powerMonitor.getSystemIdleTime()
+
+    if (softSleepWakeInterval) clearInterval(softSleepWakeInterval)
+    softSleepWakeInterval = setInterval(() => {
+      if (!softDisplaySleepActive) {
+        clearInterval(softSleepWakeInterval)
+        softSleepWakeInterval = null
+        return
+      }
+      try {
+        const cur = screen.getCursorScreenPoint()
+        if (Math.hypot(cur.x - initialCursor.x, cur.y - initialCursor.y) >= 4) {
+          wakeSoftDisplaySleep()
+          return
+        }
+        const idle = powerMonitor.getSystemIdleTime()
+        if (prevIdleTime >= 1 && idle < prevIdleTime) {
+          wakeSoftDisplaySleep()
+          return
+        }
+        prevIdleTime = idle
+      } catch (e) {
+        console.log("Error polling wake state for soft display sleep:", e)
+      }
+    }, 120)
+  }, 600)
+}
+
+async function wakeSoftDisplaySleep(options = {}) {
+  if (sleepTimeout) {
+    clearTimeout(sleepTimeout)
+    sleepTimeout = false
+  }
+  if (!softDisplaySleepActive) return
+
+  softDisplaySleepActive = false
+  softDisplaySleepArmed = false
+
+  if (softSleepArmTimeout) {
+    clearTimeout(softSleepArmTimeout)
+    softSleepArmTimeout = null
+  }
+  if (softSleepWakeInterval) {
+    clearInterval(softSleepWakeInterval)
+    softSleepWakeInterval = null
+  }
+
+  softSleepClosingWindows = true
+  for (const win of softSleepWindows) {
+    try {
+      if (win && !win.isDestroyed()) {
+        win.destroy()
+      }
+    } catch {}
+  }
+  softSleepWindows = []
+  softSleepClosingWindows = false
+
+  if (softSleepTurnedOffLGTV || lgtvPowerIsOff) {
+    softSleepTurnedOffLGTV = false
+    lgtvPowerIsOff = false
+    sendLGTVCommand("-screenon").catch((e) => {
+      console.error("Couldn't unblank LG TV after soft display sleep:", e)
+    })
+  }
+
+  if (softSleepUsedDDC) {
+    softSleepUsedDDC = false
+    for (const monitor of Object.values(monitors || {})) {
+      try {
+        if (monitor?.type === "ddcci" && monitor?.hwid) {
+          monitorsThread.send({
+            type: "vcp",
+            monitor: monitor.hwid.join("#"),
+            code: 0xD6,
+            value: 1
+          })
+        }
+      } catch {}
+    }
+  }
+
+  if (!options.skipBrightnessRestore) {
+    const savedIds = Object.keys(softSleepSavedBrightness)
+    if (savedIds.length > 0) {
+      for (const monitorId of savedIds) {
+        try {
+          updateBrightness(monitorId, softSleepSavedBrightness[monitorId])
+        } catch {}
+      }
+      sendToAllWindows('monitors-updated', monitors)
+    } else {
+      setKnownBrightness(false)
+    }
+  }
+  softSleepSavedBrightness = {}
+}
+
+function sleepDisplays(mode = "ps", delayMS = 333, options = {}) {
   try {
     if(sleepTimeout) clearTimeout(sleepTimeout);
     sleepTimeout = setTimeout(async () => {
-      //startIdleCheckShort()
-      if (mode === "ddcci" || mode === "ps_ddcci") {
-        for (let monitorID in monitors) {
-          const monitor = monitors[monitorID]
-          await turnOffDisplayDDC(monitor.hwid.join("#"))
-        }
-      }
-
-      if (mode === "ps" || mode === "ps_ddcci") {
-        exec(`powershell.exe -NoProfile (Add-Type '[DllImport(\\"user32.dll\\")]^public static extern int PostMessage(int hWnd, int hMsg, int wParam, int lParam);' -Name a -Pas)::PostMessage(0xFFFF,0x0112,0xF170,0x0002)`)
-      }
       sleepTimeout = false
+      await enterSoftDisplaySleep(mode, options)
     }, delayMS)
 
   } catch (e) {
@@ -4659,6 +4957,7 @@ if(isDev) {
 }
 
 app.on("ready", async () => {
+  startSystemSleepPrevention()
   await getAllLanguages()
   await getThemeRegistry()
   //readSettings()
@@ -5642,7 +5941,7 @@ let notIdleMonitor
 let lastIdleTime = 0
 
 let preIdleMonitors = {}
-let preIdleLGTVBacklights = false
+let preIdleLGTVDevices = false
 
 function runLGTVCommand(args) {
   return new Promise((resolve, reject) => {
@@ -5661,27 +5960,27 @@ function runLGTVCommand(args) {
 
 async function dimLGTVForIdle() {
   const output = await runLGTVCommand(["-get_system_settings", "picture", '[\\\"backlight\\\"]'])
-  let devices
+  let response
   try {
-    devices = JSON.parse(output)
+    response = JSON.parse(output)
   } catch (error) {
     console.error("Couldn't parse LGTVcli backlight response:", error, output)
     return false
   }
 
-  const backlights = {}
-  for (const [device, result] of Object.entries(devices || {})) {
+  const deviceIds = []
+  for (const [device, result] of Object.entries(response || {})) {
     const value = Number(result?.payload?.settings?.backlight)
-    if (Number.isFinite(value)) backlights[device] = value
+    if (Number.isFinite(value)) deviceIds.push(device)
   }
-  if (!Object.keys(backlights).length) {
+  if (!deviceIds.length) {
     console.error("LGTVcli returned no configured TV backlight values.")
     return false
   }
-  preIdleLGTVBacklights = backlights
+  preIdleLGTVDevices = deviceIds
 
   let succeeded = true
-  for (const device of Object.keys(backlights)) {
+  for (const device of deviceIds) {
     try {
       await runLGTVCommand(["-backlight", "0", device])
     } catch {
@@ -5693,18 +5992,18 @@ async function dimLGTVForIdle() {
 }
 
 async function restoreLGTVAfterIdle() {
-  if (!preIdleLGTVBacklights) return true
+  if (!preIdleLGTVDevices) return true
 
   let succeeded = true
-  for (const [device, brightness] of Object.entries(preIdleLGTVBacklights)) {
+  for (const device of preIdleLGTVDevices) {
     try {
-      await runLGTVCommand(["-backlight", String(brightness), device])
+      await runLGTVCommand(["-backlight", "100", device])
     } catch {
       succeeded = false
     }
   }
   if (succeeded) {
-    preIdleLGTVBacklights = false
+    preIdleLGTVDevices = false
   } else {
     console.error("Couldn't restore every LG TV's brightness after idle.")
   }
@@ -5762,7 +6061,7 @@ async function idleCheckShort() {
   try {
     const idleTime = powerMonitor.getSystemIdleTime()
 
-    if (!userIdleDimmed && settings.detectIdleTimeEnabled && !settings.disableAutoApply && idleTime >= getIdleSettingValue() && !isFocusedWindowFullscreen() && !isMediaPlaying()) {
+    if (!userIdleDimmed && !softDisplaySleepActive && settings.detectIdleTimeEnabled && !settings.disableAutoApply && idleTime >= getIdleSettingValue() && !isFocusedWindowFullscreen() && !isMediaPlaying()) {
       console.log(`\x1b[36mUser idle. Dimming displays.\x1b[0m`)
       userIdleDimmed = true
       idleMonitorBlock?.release?.()
